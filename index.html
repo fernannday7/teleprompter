@@ -219,7 +219,7 @@ input[type=color]{width:100%;height:44px;margin-top:6px;border:1px solid var(--l
     <p class="muted small" id="resMeta"></p>
     <div class="stack">
       <button class="btn primary" id="share">Compartilhar / Salvar na galeria</button>
-      <a class="btn" id="dl">Baixar arquivo</a>
+      <button class="btn" id="dl">Baixar arquivo</button>
       <div class="two">
         <button class="btn ghost" id="resClose">Fechar</button>
         <button class="btn danger" id="resDiscard">Descartar</button>
@@ -323,8 +323,7 @@ async function renderHome(){
     rec.innerHTML = '<span></span>'; rec.onclick = () => openStudio(it.id);
     card.append(body, rec); list.append(card);
   }
-  let n = 0; try{ n = await Chunks.count(); }catch(e){}
-  $('#recover').hidden = !n;
+  $('#recover').hidden = !(await hasSaved());
   let hintOff = false; try{ hintOff = localStorage.getItem('tp-hint') === 'off'; }catch(e){}
   $('#installHint').hidden = isStandalone() || hintOff;
 }
@@ -372,7 +371,78 @@ $('#edRec').onclick = async () => {
 let stream = null, rec = null, recording = false, counting = false, scrolling = false;
 let pos = 0, maxPos = 0, lastT = 0, tStart = 0, timerI = null, wakeLock = null, dimT = null;
 let pending = Promise.resolve(), memChunks = [], idbFailed = false, mime = '';
-let resultURL = null, resultFile = null, canvasStream = null;
+let resultURL = null, resultFile = null, resultName = '', canvasStream = null, storeMode = 'idb';
+
+/* ---------- arquivo único no armazenamento do celular (OPFS) ----------
+   Grava o vídeo em um só arquivo, escrito aos poucos por um "worker".
+   Evita juntar centenas de pedaços no final, que quebra no iPhone em vídeos longos. */
+const OPFS_NAME = 'gravacao-atual.bin';
+const WORKER_SRC = `
+let h = null, off = 0;
+self.onmessage = async (e) => {
+  const m = e.data;
+  try {
+    if (m.cmd === 'open') {
+      const root = await navigator.storage.getDirectory();
+      const fh = await root.getFileHandle(m.name, {create: true});
+      h = await fh.createSyncAccessHandle(); h.truncate(0); off = 0;
+    } else if (m.cmd === 'write') {
+      const u = new Uint8Array(m.buf); h.write(u, {at: off}); off += u.byteLength; h.flush();
+    } else if (m.cmd === 'close') {
+      if (h) { h.flush(); h.close(); h = null; }
+    }
+    self.postMessage({id: m.id, ok: true, size: off});
+  } catch (err) { self.postMessage({id: m.id, ok: false, err: String((err && err.message) || err)}); }
+};`;
+let recW = null, wSeq = 0;
+const wWait = {};
+function initWorker(){
+  if(recW) return;
+  recW = new Worker(URL.createObjectURL(new Blob([WORKER_SRC], {type:'text/javascript'})));
+  recW.onmessage = e => {
+    const w = wWait[e.data.id]; if(!w) return; delete wWait[e.data.id];
+    e.data.ok ? w.res(e.data) : w.rej(new Error(e.data.err));
+  };
+}
+function wcall(msg, transfer){
+  return new Promise((res, rej) => { const id = ++wSeq; wWait[id] = {res, rej}; recW.postMessage(Object.assign({id}, msg), transfer || []); });
+}
+async function opfsOK(){
+  try{
+    if(!navigator.storage || !navigator.storage.getDirectory || typeof FileSystemFileHandle === 'undefined' ||
+       !('createSyncAccessHandle' in FileSystemFileHandle.prototype) || typeof Worker === 'undefined') return false;
+    await navigator.storage.getDirectory(); return true;
+  }catch(e){ return false; }
+}
+async function opfsFile(){
+  try{ const root = await navigator.storage.getDirectory(); return await (await root.getFileHandle(OPFS_NAME)).getFile(); }
+  catch(e){ return null; }
+}
+async function opfsRemove(){ try{ const root = await navigator.storage.getDirectory(); await root.removeEntry(OPFS_NAME); }catch(e){} }
+function getMode(){ try{ return localStorage.getItem('tp-store') || 'idb'; }catch(e){ return 'idb'; } }
+function setMode(m){ storeMode = m; try{ localStorage.setItem('tp-store', m); }catch(e){} }
+async function hasSaved(){
+  if(getMode() === 'opfs'){ const f = await opfsFile(); if(f && f.size) return true; }
+  try{ return (await Chunks.count()) > 0; }catch(e){ return false; }
+}
+async function clearSaved(){ try{ await Chunks.clear(); }catch(e){} await opfsRemove(); }
+/* Converte uma gravação antiga em pedaços para arquivo único */
+async function migrateChunks(){
+  if(!(await opfsOK())) return false;
+  let parts = []; try{ parts = await Chunks.all(); }catch(e){ return false; }
+  if(!parts.length) return false;
+  toast('Preparando o vídeo…', 60000);
+  try{
+    initWorker(); await wcall({cmd:'open', name:OPFS_NAME});
+    for(const p of parts){ const buf = await p.arrayBuffer(); await wcall({cmd:'write', buf}, [buf]); }
+    await wcall({cmd:'close'});
+    setMode('opfs'); try{ await Chunks.clear(); }catch(e){}
+    $('#toast').hidden = true; return true;
+  }catch(e){
+    try{ await wcall({cmd:'close'}); }catch(_){}
+    await opfsRemove(); $('#toast').hidden = true; return false;
+  }
+}
 
 async function openStudio(idOrObj){
   const sc = typeof idOrObj === 'object' ? idOrObj : await Scripts.get(idOrObj);
@@ -557,10 +627,15 @@ async function toggleRec(){
   startRec();
 }
 async function startRec(){
-  try{ await Chunks.clear(); }catch(e){}
   memChunks = []; idbFailed = false; pending = Promise.resolve();
+  await clearSaved();
+  let mode = (await opfsOK()) ? 'opfs' : 'idb';
+  if(mode === 'opfs'){
+    try{ initWorker(); await wcall({cmd:'open', name:OPFS_NAME}); }catch(e){ mode = 'idb'; }
+  }
+  setMode(mode);
   mime = pickMime();
-  const opts = {videoBitsPerSecond: S.res === '1080' ? 12000000 : 6000000, audioBitsPerSecond: 128000};
+  const opts = {videoBitsPerSecond: S.res === '1080' ? 8000000 : 5000000, audioBitsPerSecond: 128000};
   if(mime) opts.mimeType = mime;
   // Grava o quadro já recortado (vertical ou horizontal) + o áudio do microfone
   let recStream = stream;
@@ -578,14 +653,21 @@ async function startRec(){
   rec.ondataavailable = e => {
     if(!e.data || !e.data.size) return;
     const b = e.data;
-    pending = pending.then(() => {
+    pending = pending.then(async () => {
       if(idbFailed){ memChunks.push(b); return; }
+      if(storeMode === 'opfs'){
+        try{ const buf = await b.arrayBuffer(); await wcall({cmd:'write', buf}, [buf]); }
+        catch(e){ idbFailed = true; memChunks.push(b); }
+        return;
+      }
       return Chunks.add(b).catch(() => { idbFailed = true; memChunks.push(b); });
     });
   };
   rec.onstop = async () => {
     if(canvasStream){ canvasStream.getTracks().forEach(t => t.stop()); canvasStream = null; }
-    await pending; showResult();
+    await pending;
+    if(storeMode === 'opfs'){ try{ await wcall({cmd:'close'}); }catch(e){} }
+    showResult();
   };
   rec.start(2000);
   recording = true; tStart = Date.now();
@@ -617,12 +699,22 @@ function fileName(ext){
 }
 async function showResult(){
   let parts = [];
-  try{ parts = await Chunks.all(); }catch(e){}
+  // Gravação antiga em pedaços: converte para arquivo único antes de abrir
+  if(getMode() !== 'opfs' && !recording){
+    let n = 0; try{ n = await Chunks.count(); }catch(e){}
+    if(n > 1) await migrateChunks();
+  }
+  if(getMode() === 'opfs'){
+    const f = await opfsFile();
+    if(f && f.size) parts.push(f);
+  } else {
+    try{ parts = await Chunks.all(); }catch(e){}
+  }
   parts = parts.concat(memChunks);
   if(!parts.length){ toast('Nenhum vídeo foi gravado.'); return; }
   let m = mime; try{ m = localStorage.getItem('tp-mime') || mime; }catch(e){}
   const type = (m || 'video/mp4').split(';')[0];
-  const blob = new Blob(parts, {type});
+  const blob = parts.length === 1 ? parts[0].slice(0, parts[0].size, type) : new Blob(parts, {type});
   const ext = type.indexOf('webm') >= 0 ? 'webm' : 'mp4';
   const name = fileName(ext);
   try{ resultFile = new File([blob], name, {type}); }catch(e){ resultFile = null; }
@@ -630,21 +722,33 @@ async function showResult(){
   resultURL = URL.createObjectURL(blob);
   $('#resVideo').src = resultURL;
   $('#resMeta').textContent = name + ' · ' + (blob.size / 1048576).toFixed(1).replace('.', ',') + ' MB';
-  $('#dl').href = resultURL; $('#dl').download = name;
-  let canShare = false;
-  try{ canShare = !!(resultFile && navigator.canShare && navigator.canShare({files:[resultFile]})); }catch(e){}
-  $('#share').hidden = !canShare;
+  resultName = name;
+  $('#share').hidden = !(navigator.share && resultFile);
   $('#result').hidden = false;
 }
+async function shareVideo(){
+  try{ await navigator.share({files:[resultFile]}); return true; }
+  catch(e){ if(e.name === 'AbortError') return true; return false; }
+}
 $('#share').onclick = async () => {
-  try{ await navigator.share({files:[resultFile], title:'Vídeo'}); }
-  catch(e){ if(e.name !== 'AbortError') toast('Não foi possível compartilhar. Use "Baixar arquivo".'); }
+  if(!(await shareVideo())) toast('Não foi possível abrir o compartilhamento. Tente "Baixar arquivo".', 3500);
+};
+$('#dl').onclick = async () => {
+  // No iPhone (principalmente no app da Tela de Início), baixar abre uma janela que não acessa o vídeo,
+  // então usamos o menu de compartilhar, que tem "Salvar Vídeo" e "Salvar em Arquivos".
+  const ios = /iP(hone|ad|od)/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  if(ios && navigator.share && resultFile){
+    if(await shareVideo()) return;
+  }
+  const a = document.createElement('a');
+  a.href = resultURL; a.download = resultName || 'video.mp4';
+  document.body.appendChild(a); a.click(); a.remove();
 };
 function closeResult(){ $('#result').hidden = true; $('#resVideo').pause(); }
 $('#resClose').onclick = () => { closeResult(); if(!$('#home').hidden) renderHome(); };
 $('#resDiscard').onclick = async () => {
   if(!confirm('Descartar este vídeo? Ele será apagado do app.')) return;
-  try{ await Chunks.clear(); }catch(e){}
+  await clearSaved();
   memChunks = []; closeResult();
   $('#resVideo').removeAttribute('src');
   if(resultURL){ URL.revokeObjectURL(resultURL); resultURL = null; }

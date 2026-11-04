@@ -61,7 +61,7 @@ h2{font-size:20px;margin:0}
 /* ---------- estúdio ---------- */
 #studio{position:fixed;inset:0;background:#000;overflow:hidden;--fs:34px;--margin:20px;--op:.55;--areaH:42;--color:#fff;--align:left}
 #cam{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
-#frame{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:#000}
+#frame{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;object-position:center top;background:#000}
 #frame.mirror{transform:scaleX(-1)}
 #prompt{position:absolute;left:0;right:0;top:0;height:calc(var(--areaH) * 1vh);background:rgba(0,0,0,var(--op));overflow:hidden;touch-action:none;
   -webkit-mask-image:linear-gradient(to bottom,transparent 0,#000 9%,#000 86%,transparent 100%);mask-image:linear-gradient(to bottom,transparent 0,#000 9%,#000 86%,transparent 100%)}
@@ -477,7 +477,7 @@ async function startCamera(){
   if(!window.isSecureContext) return camError('O app precisa ser aberto por um endereço <b>https://</b> para usar a câmera.');
   if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return camError('Este navegador não permite usar a câmera. Use o Safari (iPhone) ou o Chrome (Android).');
   const t = target();
-  const big = S.res === '1080' ? [3840, 2160] : [1920, 1080];
+  const big = S.res === '1080' ? [1920, 1080] : [1280, 720];
   try{
     // 1ª tentativa: resolução máxima da câmera
     let best = await openCam(big[0], big[1]);
@@ -504,8 +504,9 @@ async function startCamera(){
   $('#camErr').hidden = true;
   startDraw();
   const v = $('#cam');
-  $('#camInfo').textContent = 'Câmera: ' + v.videoWidth + '×' + v.videoHeight + ' → vídeo final: ' + t.w + '×' + t.h + '.' +
-    (S.orient === 'h' ? ' Para vídeo horizontal, gire o celular.' : '');
+  const info = 'Câmera: ' + v.videoWidth + '×' + v.videoHeight + ' → vídeo final: ' + t.w + '×' + t.h;
+  $('#camInfo').textContent = info + '.' + (S.orient === 'h' ? ' Para vídeo horizontal, gire o celular.' : '');
+  toast(info, 3500);
 }
 
 /* Desenha cada quadro da câmera já recortado no formato final */

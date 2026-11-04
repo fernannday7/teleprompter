@@ -61,7 +61,8 @@ h2{font-size:20px;margin:0}
 /* ---------- estúdio ---------- */
 #studio{position:fixed;inset:0;background:#000;overflow:hidden;--fs:34px;--margin:20px;--op:.55;--areaH:42;--color:#fff;--align:left}
 #cam{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
-#cam.mirror{transform:scaleX(-1)}
+#frame{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:#000}
+#frame.mirror{transform:scaleX(-1)}
 #prompt{position:absolute;left:0;right:0;top:0;height:calc(var(--areaH) * 1vh);background:rgba(0,0,0,var(--op));overflow:hidden;touch-action:none;
   -webkit-mask-image:linear-gradient(to bottom,transparent 0,#000 9%,#000 86%,transparent 100%);mask-image:linear-gradient(to bottom,transparent 0,#000 9%,#000 86%,transparent 100%)}
 #guide{position:absolute;left:0;right:0;top:30%;height:calc(var(--fs) * 1.35);background:rgba(255,255,255,.07);border-top:2px solid rgba(255,59,71,.75);pointer-events:none}
@@ -150,6 +151,7 @@ input[type=color]{width:100%;height:44px;margin-top:6px;border:1px solid var(--l
 <!-- ================= ESTÚDIO ================= -->
 <section id="studio" class="screen" hidden>
   <video id="cam" autoplay playsinline muted></video>
+  <canvas id="frame"></canvas>
 
   <div id="prompt">
     <div id="guide"></div>
@@ -370,7 +372,7 @@ $('#edRec').onclick = async () => {
 let stream = null, rec = null, recording = false, counting = false, scrolling = false;
 let pos = 0, maxPos = 0, lastT = 0, tStart = 0, timerI = null, wakeLock = null, dimT = null;
 let pending = Promise.resolve(), memChunks = [], idbFailed = false, mime = '';
-let resultURL = null, resultFile = null;
+let resultURL = null, resultFile = null, canvasStream = null;
 
 async function openStudio(idOrObj){
   const sc = typeof idOrObj === 'object' ? idOrObj : await Scripts.get(idOrObj);
@@ -438,29 +440,94 @@ function camMsg(e){
 }
 function camError(html){ $('#camErrMsg').innerHTML = html; $('#camErr').hidden = false; }
 function stopCamera(){ if(stream){ stream.getTracks().forEach(t => t.stop()); stream = null; } }
+
+/* Tamanho final do vídeo (o que é gravado), independente de como a câmera entrega a imagem */
+function target(){
+  const hi = S.res === '1080', L = hi ? 1920 : 1280, s = hi ? 1080 : 720;
+  return S.orient === 'v' ? {w:s, h:L} : {w:L, h:s};
+}
+/* Recorte central da imagem da câmera no formato escolhido */
+function crop(vw, vh){
+  const t = target(), a = t.w / t.h;
+  let cw, ch;
+  if(vw / vh > a){ ch = vh; cw = vh * a; } else { cw = vw; ch = vw / a; }
+  return {sx:(vw - cw) / 2, sy:(vh - ch) / 2, cw, ch};
+}
+function waitMeta(v){
+  return new Promise(res => {
+    if(v.videoWidth) return res();
+    const done = () => { v.removeEventListener('loadedmetadata', done); res(); };
+    v.addEventListener('loadedmetadata', done); setTimeout(done, 2500);
+  });
+}
+async function openCam(w, h){
+  const s = await navigator.mediaDevices.getUserMedia({
+    audio: {echoCancellation:true, noiseSuppression:true, autoGainControl:true},
+    video: {facingMode:S.facing, width:{ideal:w}, height:{ideal:h}, frameRate:{ideal:30}}
+  });
+  const vid = $('#cam');
+  vid.srcObject = s;
+  try{ await vid.play(); }catch(e){}
+  await waitMeta(vid);
+  const q = vid.videoWidth ? crop(vid.videoWidth, vid.videoHeight).cw : 0; // nitidez útil depois do recorte
+  return {s, q};
+}
 async function startCamera(){
   stopCamera();
   if(!window.isSecureContext) return camError('O app precisa ser aberto por um endereço <b>https://</b> para usar a câmera.');
   if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return camError('Este navegador não permite usar a câmera. Use o Safari (iPhone) ou o Chrome (Android).');
-  const hi = S.res === '1080', L = hi ? 1920 : 1280, s = hi ? 1080 : 720, v = S.orient === 'v';
-  const c = {
-    audio: {echoCancellation:true, noiseSuppression:true, autoGainControl:true},
-    video: {facingMode:S.facing, width:{ideal: v ? s : L}, height:{ideal: v ? L : s}, frameRate:{ideal:30}}
-  };
-  try{ stream = await navigator.mediaDevices.getUserMedia(c); }
-  catch(e){
+  const t = target();
+  const big = S.res === '1080' ? [3840, 2160] : [1920, 1080];
+  try{
+    // 1ª tentativa: resolução máxima da câmera
+    let best = await openCam(big[0], big[1]);
+    // Se a imagem útil ficou abaixo do tamanho final, tenta a câmera na outra orientação e fica com a melhor
+    if(best.q < t.w){
+      best.s.getTracks().forEach(x => x.stop());
+      let alt = null;
+      try{ alt = await openCam(big[1], big[0]); }catch(e){}
+      if(alt && alt.q >= best.q) best = alt;
+      else{ if(alt) alt.s.getTracks().forEach(x => x.stop()); best = await openCam(big[0], big[1]); }
+    }
+    stream = best.s;
+  }catch(e){
     if(e.name === 'NotAllowedError') return camError(camMsg(e));
-    try{ stream = await navigator.mediaDevices.getUserMedia({audio:true, video:{facingMode:S.facing}}); }
-    catch(e2){ return camError(camMsg(e2)); }
+    try{
+      stream = await navigator.mediaDevices.getUserMedia({audio:true, video:{facingMode:S.facing}});
+      $('#cam').srcObject = stream; try{ await $('#cam').play(); }catch(_){}
+      await waitMeta($('#cam'));
+    }catch(e2){ return camError(camMsg(e2)); }
   }
-  const vid = $('#cam');
-  vid.srcObject = stream;
-  vid.classList.toggle('mirror', S.facing === 'user');
-  try{ await vid.play(); }catch(e){}
+  const fr = $('#frame');
+  fr.width = t.w; fr.height = t.h;
+  fr.classList.toggle('mirror', S.facing === 'user');
   $('#camErr').hidden = true;
-  const set = stream.getVideoTracks()[0].getSettings ? stream.getVideoTracks()[0].getSettings() : {};
-  $('#camInfo').textContent = (set.width && set.height ? 'Câmera atual: ' + set.width + '×' + set.height + '. ' : '') +
-    (S.orient === 'h' ? 'Para vídeo horizontal, gire o celular.' : '');
+  startDraw();
+  const v = $('#cam');
+  $('#camInfo').textContent = 'Câmera: ' + v.videoWidth + '×' + v.videoHeight + ' → vídeo final: ' + t.w + '×' + t.h + '.' +
+    (S.orient === 'h' ? ' Para vídeo horizontal, gire o celular.' : '');
+}
+
+/* Desenha cada quadro da câmera já recortado no formato final */
+let drawing = false;
+function drawFrame(){
+  const v = $('#cam'), fr = $('#frame');
+  if(!stream || !v.videoWidth || v.readyState < 2) return;
+  const c = crop(v.videoWidth, v.videoHeight);
+  const ctx = fr.getContext('2d');
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(v, c.sx, c.sy, c.cw, c.ch, 0, 0, fr.width, fr.height);
+}
+function startDraw(){
+  if(drawing) return; drawing = true;
+  const v = $('#cam');
+  if('requestVideoFrameCallback' in HTMLVideoElement.prototype){
+    const tick = () => { drawFrame(); v.requestVideoFrameCallback(tick); };
+    v.requestVideoFrameCallback(tick);
+  } else {
+    const tick = () => { if(!$('#studio').hidden) drawFrame(); requestAnimationFrame(tick); };
+    requestAnimationFrame(tick);
+  }
 }
 $('#camRetry').onclick = startCamera;
 $('#camErrBack').onclick = leaveStudio;
@@ -492,10 +559,19 @@ async function startRec(){
   try{ await Chunks.clear(); }catch(e){}
   memChunks = []; idbFailed = false; pending = Promise.resolve();
   mime = pickMime();
-  const opts = {videoBitsPerSecond: S.res === '1080' ? 8000000 : 5000000, audioBitsPerSecond: 128000};
+  const opts = {videoBitsPerSecond: S.res === '1080' ? 12000000 : 6000000, audioBitsPerSecond: 128000};
   if(mime) opts.mimeType = mime;
-  try{ rec = new MediaRecorder(stream, opts); }
-  catch(e){ try{ rec = new MediaRecorder(stream); }catch(e2){ return toast('Não foi possível iniciar a gravação: ' + e2.message, 4000); } }
+  // Grava o quadro já recortado (vertical ou horizontal) + o áudio do microfone
+  let recStream = stream;
+  const fr = $('#frame');
+  if(fr.captureStream){
+    try{
+      canvasStream = fr.captureStream(30);
+      recStream = new MediaStream([...canvasStream.getVideoTracks(), ...stream.getAudioTracks()]);
+    }catch(e){ recStream = stream; }
+  }
+  try{ rec = new MediaRecorder(recStream, opts); }
+  catch(e){ try{ rec = new MediaRecorder(recStream); }catch(e2){ return toast('Não foi possível iniciar a gravação: ' + e2.message, 4000); } }
   mime = rec.mimeType || mime || 'video/mp4';
   try{ localStorage.setItem('tp-mime', mime); }catch(e){}
   rec.ondataavailable = e => {
@@ -506,7 +582,10 @@ async function startRec(){
       return Chunks.add(b).catch(() => { idbFailed = true; memChunks.push(b); });
     });
   };
-  rec.onstop = async () => { await pending; showResult(); };
+  rec.onstop = async () => {
+    if(canvasStream){ canvasStream.getTracks().forEach(t => t.stop()); canvasStream = null; }
+    await pending; showResult();
+  };
   rec.start(2000);
   recording = true; tStart = Date.now();
   clearInterval(timerI); timerI = setInterval(updTimer, 500); updTimer();

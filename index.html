@@ -376,7 +376,9 @@ let resultURL = null, resultFile = null, resultName = '', canvasStream = null, s
 /* ---------- arquivo único no armazenamento do celular (OPFS) ----------
    Grava o vídeo em um só arquivo, escrito aos poucos por um "worker".
    Evita juntar centenas de pedaços no final, que quebra no iPhone em vídeos longos. */
-const OPFS_NAME = 'gravacao-atual.bin';
+function curName(){ try{ return localStorage.getItem('tp-file') || ''; }catch(e){ return ''; } }
+function setName(n){ try{ localStorage.setItem('tp-file', n); }catch(e){} }
+function extOf(m){ return (m || '').indexOf('webm') >= 0 ? 'webm' : 'mp4'; }
 const WORKER_SRC = `
 let h = null, off = 0;
 self.onmessage = async (e) => {
@@ -415,10 +417,26 @@ async function opfsOK(){
   }catch(e){ return false; }
 }
 async function opfsFile(){
-  try{ const root = await navigator.storage.getDirectory(); return await (await root.getFileHandle(OPFS_NAME)).getFile(); }
+  const n = curName(); if(!n) return null;
+  try{ const root = await navigator.storage.getDirectory(); return await (await root.getFileHandle(n)).getFile(); }
   catch(e){ return null; }
 }
-async function opfsRemove(){ try{ const root = await navigator.storage.getDirectory(); await root.removeEntry(OPFS_NAME); }catch(e){} }
+/* Apaga todos os vídeos guardados no armazenamento do app */
+async function opfsRemove(){
+  try{
+    const root = await navigator.storage.getDirectory();
+    const names = [];
+    try{ for await (const k of root.keys()) names.push(k); }catch(e){ if(curName()) names.push(curName()); }
+    for(const k of names){ try{ await root.removeEntry(k); }catch(e){} }
+  }catch(e){}
+}
+/* Solta o vídeo que está aberto na tela de resultado antes de apagar ou gravar outro */
+function releaseResult(){
+  const v = $('#resVideo');
+  try{ v.pause(); v.removeAttribute('src'); v.load(); }catch(e){}
+  if(resultURL){ URL.revokeObjectURL(resultURL); resultURL = null; }
+  resultFile = null;
+}
 function getMode(){ try{ return localStorage.getItem('tp-store') || 'idb'; }catch(e){ return 'idb'; } }
 function setMode(m){ storeMode = m; try{ localStorage.setItem('tp-store', m); }catch(e){} }
 async function hasSaved(){
@@ -432,8 +450,10 @@ async function migrateChunks(){
   let parts = []; try{ parts = await Chunks.all(); }catch(e){ return false; }
   if(!parts.length) return false;
   toast('Preparando o vídeo…', 60000);
+  let m = ''; try{ m = localStorage.getItem('tp-mime') || ''; }catch(e){}
+  const name = fileName(extOf(m));
   try{
-    initWorker(); await wcall({cmd:'open', name:OPFS_NAME});
+    initWorker(); await wcall({cmd:'open', name}); setName(name);
     for(const p of parts){ const buf = await p.arrayBuffer(); await wcall({cmd:'write', buf}, [buf]); }
     await wcall({cmd:'close'});
     setMode('opfs'); try{ await Chunks.clear(); }catch(e){}
@@ -627,13 +647,9 @@ async function toggleRec(){
   startRec();
 }
 async function startRec(){
+  releaseResult();
   memChunks = []; idbFailed = false; pending = Promise.resolve();
   await clearSaved();
-  let mode = (await opfsOK()) ? 'opfs' : 'idb';
-  if(mode === 'opfs'){
-    try{ initWorker(); await wcall({cmd:'open', name:OPFS_NAME}); }catch(e){ mode = 'idb'; }
-  }
-  setMode(mode);
   mime = pickMime();
   const opts = {videoBitsPerSecond: S.res === '1080' ? 8000000 : 5000000, audioBitsPerSecond: 128000};
   if(mime) opts.mimeType = mime;
@@ -650,6 +666,13 @@ async function startRec(){
   catch(e){ try{ rec = new MediaRecorder(recStream); }catch(e2){ return toast('Não foi possível iniciar a gravação: ' + e2.message, 4000); } }
   mime = rec.mimeType || mime || 'video/mp4';
   try{ localStorage.setItem('tp-mime', mime); }catch(e){}
+  // Cada gravação ganha um arquivo novo, com nome próprio (nunca reaproveita o anterior)
+  let mode = (await opfsOK()) ? 'opfs' : 'idb';
+  if(mode === 'opfs'){
+    const name = fileName(extOf(mime));
+    try{ initWorker(); await wcall({cmd:'open', name}); setName(name); }catch(e){ mode = 'idb'; }
+  }
+  setMode(mode);
   rec.ondataavailable = e => {
     if(!e.data || !e.data.size) return;
     const b = e.data;
@@ -695,7 +718,7 @@ $('#recBtn').onclick = toggleRec;
 /* ---------- resultado ---------- */
 function fileName(ext){
   const d = new Date(), p = n => String(n).padStart(2,'0');
-  return 'video-' + d.getFullYear() + '-' + p(d.getMonth()+1) + '-' + p(d.getDate()) + '_' + p(d.getHours()) + '-' + p(d.getMinutes()) + '.' + ext;
+  return 'video-' + d.getFullYear() + '-' + p(d.getMonth()+1) + '-' + p(d.getDate()) + '_' + p(d.getHours()) + '-' + p(d.getMinutes()) + '-' + p(d.getSeconds()) + '.' + ext;
 }
 async function showResult(){
   let parts = [];
@@ -714,11 +737,17 @@ async function showResult(){
   if(!parts.length){ toast('Nenhum vídeo foi gravado.'); return; }
   let m = mime; try{ m = localStorage.getItem('tp-mime') || mime; }catch(e){}
   const type = (m || 'video/mp4').split(';')[0];
-  const blob = parts.length === 1 ? parts[0].slice(0, parts[0].size, type) : new Blob(parts, {type});
-  const ext = type.indexOf('webm') >= 0 ? 'webm' : 'mp4';
-  const name = fileName(ext);
-  try{ resultFile = new File([blob], name, {type}); }catch(e){ resultFile = null; }
-  if(resultURL) URL.revokeObjectURL(resultURL);
+  releaseResult();
+  let blob, name;
+  if(parts.length === 1 && parts[0] instanceof File && getMode() === 'opfs'){
+    // Usa o próprio arquivo do celular, sem copiar nem reembalar
+    const f = parts[0]; name = f.name;
+    if(f.type){ blob = f; resultFile = f; }
+    else{ blob = f.slice(0, f.size, type); try{ resultFile = new File([blob], name, {type}); }catch(e){ resultFile = null; } }
+  } else {
+    blob = new Blob(parts, {type}); name = fileName(extOf(type));
+    try{ resultFile = new File([blob], name, {type}); }catch(e){ resultFile = null; }
+  }
   resultURL = URL.createObjectURL(blob);
   $('#resVideo').src = resultURL;
   $('#resMeta').textContent = name + ' · ' + (blob.size / 1048576).toFixed(1).replace('.', ',') + ' MB';
@@ -748,10 +777,9 @@ function closeResult(){ $('#result').hidden = true; $('#resVideo').pause(); }
 $('#resClose').onclick = () => { closeResult(); if(!$('#home').hidden) renderHome(); };
 $('#resDiscard').onclick = async () => {
   if(!confirm('Descartar este vídeo? Ele será apagado do app.')) return;
+  closeResult(); releaseResult();
   await clearSaved();
-  memChunks = []; closeResult();
-  $('#resVideo').removeAttribute('src');
-  if(resultURL){ URL.revokeObjectURL(resultURL); resultURL = null; }
+  memChunks = [];
   if(!$('#home').hidden) renderHome();
 };
 
